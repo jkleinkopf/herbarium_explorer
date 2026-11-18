@@ -17,6 +17,12 @@
       {"sp":"Quercus robur","year":1952,"month":6,
        "lat":51.2345,"lon":-0.1234,"id":"1234567890","herb":"K"}
 
+  Popup images come from GBIF's image cache, resolved on demand
+  via api.gbif.org. Clicking an image opens the ORIGINAL media
+  file (the identifier on the publishing institution's server)
+  in a new tab. Records with no GBIF id or no media simply show
+  no image — nothing breaks.
+
   Mobile layout: two tabs at the bottom (Map / Charts & Filters).
   Desktop layout: sidebar on the left (25%), map on the right (75%).
 
@@ -31,6 +37,7 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/blueimp-md5@2.19.0/js/md5.min.js"></script>
 
 <style>
   * { box-sizing: border-box; }
@@ -81,11 +88,6 @@
   .sp-name { font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .chart-box { position: relative; height: 200px; }
-
-  /* touch-action: pan-y on the year chart means:
-       • vertical swipe  → browser scrolls the sidebar (good)
-       • horizontal drag → JS gets the event and applies the filter
-     On desktop this is a no-op (no touch events), so it's safe everywhere. */
   #yearChart { touch-action: pan-y; }
 
   #map { height: 100%; background: #dfe3e6; }
@@ -98,6 +100,53 @@
   }
   button:hover { background: #e9ecef; }
   button:active { background: #dee2e6; }
+
+  /* ══════════════════════════════════════════════════════════════
+     Popup styling — centred, clickable specimen image
+     ══════════════════════════════════════════════════════════════ */
+  .leaflet-popup-content {
+    margin: 10px 12px;
+    line-height: 1.45;
+    font-size: .85rem;
+  }
+
+  /* flexbox centres the anchor (and therefore the image) */
+  .popup-img {
+    display: flex;
+    justify-content: center;
+    margin-top: 6px;
+  }
+
+  .popup-img-link {
+    display: inline-block;
+    cursor: pointer;
+    line-height: 0;                 /* remove baseline gap under the img */
+    border-radius: 4px;
+    transition: opacity .15s;
+  }
+  .popup-img-link:hover { opacity: 0.9; }
+
+  .popup-specimen {
+    max-width: 100%;
+    max-height: 180px;
+    border-radius: 4px;
+    border: 1px solid #dee2e6;
+    display: block;
+    transition: border-color .15s;
+  }
+  .popup-img-link:hover .popup-specimen { border-color: #0d6efd; }
+
+  /* spinner used both in the overlay and inside the popup */
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid rgba(13,110,253,.15);
+    border-top-color: #0d6efd;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+    vertical-align: -2px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* ══════════════════════════════════════════════════════════════
      Overlay (loading / errors)
@@ -116,18 +165,6 @@
     font-size: .88em;
   }
 
-  .spinner {
-    display: inline-block;
-    width: 18px; height: 18px;
-    border: 3px solid rgba(13,110,253,.15);
-    border-top-color: #0d6efd;
-    border-radius: 50%;
-    animation: spin .8s linear infinite;
-    margin-right: 8px;
-    vertical-align: -3px;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
   /* ══════════════════════════════════════════════════════════════
      Mobile tab bar (hidden by default)
      ══════════════════════════════════════════════════════════════ */
@@ -142,7 +179,6 @@
     #app {
       display: block;
       position: relative;
-      grid-template-columns: none;
       height: calc(100vh  - 56px);
       height: calc(100dvh - 56px);
       overflow: hidden;
@@ -196,7 +232,6 @@
       box-shadow: inset 0 2px 0 #0d6efd;
     }
 
-    /* Bigger tap targets on phones */
     #sidebar h1 { font-size: 1.1rem; }
     #status     { font-size: .84rem; }
     .panel h2   { font-size: .8rem; }
@@ -206,9 +241,11 @@
     #reset { padding: 10px 16px; font-size: .9rem; }
 
     .chart-box { height: 220px; }
+
+    .leaflet-popup-content { margin: 8px 10px; }
+    .popup-specimen { max-height: 140px; }
   }
 
-  /* Extra-small tweaks for landscape phones */
   @media (max-width: 860px) and (max-height: 500px) {
     #app { height: calc(100vh  - 44px); height: calc(100dvh - 44px); }
     #mobile-tabs { height: 44px; }
@@ -247,7 +284,6 @@
   <div id="map"></div>
 </div>
 
-<!-- Mobile-only tab bar -->
 <nav id="mobile-tabs" aria-label="View switcher">
   <button type="button" data-tab="map" class="active">Map</button>
   <button type="button" data-tab="controls">Charts &amp; Filters</button>
@@ -256,7 +292,7 @@
 <div id="overlay">
   <div id="overlay-body">
     <h2><span class="spinner"></span>Loading specimens…</h2>
-    <p id="overlay-hint" style="color:#6c757d;font-size:.82em;margin:10px 0 0">
+    <p style="color:#6c757d;font-size:.82em;margin:10px 0 0">
       First load may take a few seconds on a phone.
     </p>
   </div>
@@ -278,12 +314,15 @@
   const YEAR_SANE_MIN = 1500;
   const YEAR_SANE_MAX = 2100;
 
-  // Touch devices get slightly larger markers for easier tapping.
   const IS_TOUCH = (window.matchMedia &&
                     window.matchMedia('(pointer: coarse)').matches) ||
                    ('ontouchstart' in window);
-  const RADIUS_TIERS   = IS_TOUCH ? [4, 6, 8]   : [3, 4.5, 6];
+  const RADIUS_TIERS   = IS_TOUCH ? [4, 6, 8] : [3, 4.5, 6];
   const SELECTED_EXTRA = 3;
+
+  // Per-session caches so re-opening the same popup is instant.
+  const occurrenceCache = new Map();   // gbifID -> occurrence JSON
+  const imageCache      = new Map();   // gbifID -> {cacheUrl, originalUrl} | null
 
   function toNum(v) {
     if (v === null || v === undefined || v === '') return null;
@@ -438,6 +477,9 @@
       ' of ' + specimens.length.toLocaleString() + ' specimens';
   }
 
+  /* ══════════════════════════════════════════════════════════════
+     Popup HTML
+     ══════════════════════════════════════════════════════════════ */
   function popupHtml(r) {
     const yearTxt  = r.year  == null ? '—' : r.year;
     const monthTxt = r.month == null ? '' : ' (' + MONTH_NAMES[Math.round(r.month) - 1] + ')';
@@ -448,12 +490,100 @@
       ? ' · <a href="https://www.gbif.org/occurrence/' +
         encodeURIComponent(r.id) + '" target="_blank" rel="noopener">GBIF</a>'
       : '';
+
+    const imgContainer = r.id != null
+      ? '<div class="popup-img" data-gbif-id="' + escapeHtml(r.id) + '"></div>'
+      : '';
+
     return '<strong style="font-style:italic">' + escapeHtml(r.sp) + '</strong>' +
            herbTxt + '<br>' +
            'Collected: ' + yearTxt + monthTxt + linkTxt + '<br>' +
            '<span style="color:#6c757d;font-size:.85em">' +
-           r.lat.toFixed(3) + ', ' + r.lon.toFixed(3) + '</span>';
+           r.lat.toFixed(3) + ', ' + r.lon.toFixed(3) + '</span>' +
+           imgContainer;
   }
+
+  /* ══════════════════════════════════════════════════════════════
+     GBIF image resolution — returns { cacheUrl, originalUrl }
+     cacheUrl   = GBIF's image-cache endpoint (used as the <img> src)
+     originalUrl = the publishing institution's original file (the <a> href)
+     ══════════════════════════════════════════════════════════════ */
+  async function resolveImage(gbifId) {
+    if (imageCache.has(gbifId)) return imageCache.get(gbifId);
+
+    let data;
+    if (occurrenceCache.has(gbifId)) {
+      data = occurrenceCache.get(gbifId);
+    } else {
+      const res = await fetch('https://api.gbif.org/v1/occurrence/' +
+                              encodeURIComponent(gbifId));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      data = await res.json();
+      occurrenceCache.set(gbifId, data);
+    }
+
+    const media = Array.isArray(data.media) ? data.media : [];
+    const still = media.find(m => m.type === 'StillImage' && m.identifier);
+    const anyImg = media.find(m => m.identifier &&
+                                   /\.(jpe?g|png|gif|webp)(\?|$)/i.test(m.identifier));
+    const chosen = still || anyImg;
+
+    let result = null;
+    if (chosen && chosen.identifier && typeof md5 === 'function') {
+      const hash = md5(chosen.identifier);
+      result = {
+        cacheUrl:    'https://api.gbif.org/v1/image/cache/occurrence/' +
+                     encodeURIComponent(gbifId) + '/media/' + hash,
+        originalUrl: chosen.identifier
+      };
+    }
+    imageCache.set(gbifId, result);
+    return result;
+  }
+
+  function renderImage(holder, res) {
+    if (!res) { holder.innerHTML = ''; return; }
+    holder.innerHTML =
+      '<a class="popup-img-link" href="' + escapeHtml(res.originalUrl) + '" ' +
+         'target="_blank" rel="noopener" title="Open original image">' +
+        '<img class="popup-specimen" alt="Specimen image" ' +
+             'src="' + escapeHtml(res.cacheUrl) + '">' +
+      '</a>';
+    const img = holder.querySelector('img');
+    if (img) {
+      img.addEventListener('error', function () {
+        holder.innerHTML = '';
+      }, { once: true });
+    }
+  }
+
+  map.on('popupopen', function (e) {
+    const popupEl = e.popup.getElement();
+    if (!popupEl) return;
+    const holder = popupEl.querySelector('.popup-img');
+    if (!holder) return;
+
+    const gbifId = holder.getAttribute('data-gbif-id');
+    if (!gbifId) return;
+
+    // Already resolved? Render immediately.
+    if (imageCache.has(gbifId)) {
+      renderImage(holder, imageCache.get(gbifId));
+      return;
+    }
+
+    holder.innerHTML = '<span style="color:#6c757d;font-size:.78em">' +
+                       '<span class="spinner"></span> Loading image…</span>';
+
+    resolveImage(gbifId)
+      .then(res => {
+        if (!holder.isConnected) return;   // popup closed before fetch finished
+        renderImage(holder, res);
+      })
+      .catch(() => {
+        if (holder.isConnected) holder.innerHTML = '';
+      });
+  });
 
   /* ══════════════════════════════════════════════════════════════
      Year chart
@@ -763,8 +893,6 @@
     function activate(name) {
       btns.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
       sidebarEl.classList.toggle('mobile-active', name === 'controls');
-      // Map stays behind the sidebar; when it becomes visible again,
-      // ask Leaflet to re-check its container size, just in case.
       if (name === 'map') setTimeout(() => map.invalidateSize(), 60);
     }
 
@@ -772,7 +900,6 @@
       b.addEventListener('click', () => activate(b.dataset.tab));
     });
 
-    // Default to Map tab
     activate('map');
   }
 
@@ -785,7 +912,6 @@
   }
 
   function init(raw) {
-    // ── normalise ──────────────────────────────────────────────
     specimens = [];
     for (let i = 0; i < raw.length; i++) {
       const r = raw[i];
@@ -799,7 +925,7 @@
         month: toNum(r.month),
         lat:   lat,
         lon:   lon,
-        id:    r.id != null ? r.id : null,
+        id:    r.id != null ? String(r.id) : null,
         herb:  r.herb != null && String(r.herb).trim() ? String(r.herb).trim() : null
       });
     }
@@ -810,14 +936,12 @@
       return;
     }
 
-    // ── species & colours ─────────────────────────────────────
     speciesList = Array.from(new Set(specimens.map(function (r) { return r.sp; })))
       .sort(function (a, b) { return a.localeCompare(b); });
     speciesList.forEach(function (sp, i) {
       SPECIES_COLOR[sp] = PALETTE[i % PALETTE.length];
     });
 
-    // ── year domain ───────────────────────────────────────────
     let lo = Infinity, hi = -Infinity;
     for (let i = 0; i < specimens.length; i++) {
       const y = specimens[i].year;
@@ -834,7 +958,6 @@
       GLOBAL_MAX_YEAR += 1;
     }
 
-    // ── pre-build markers ─────────────────────────────────────
     markersArr = specimens.map(function (r) {
       const m = L.circleMarker([r.lat, r.lon], {
         radius: RADIUS_TIERS[0],
@@ -843,12 +966,12 @@
         fillOpacity: 0.8,
         bubblingMouseEvents: false
       });
+      m._specimenRecord = r;
       m.bindPopup(function () { return popupHtml(r); });
       m.on('click', function () { selectMarker(m); });
       return m;
     });
 
-    // ── UI ────────────────────────────────────────────────────
     buildSpeciesList();
     buildYearChart();
     buildMonthChart();
@@ -857,7 +980,6 @@
 
     overlayEl.classList.add('hidden');
 
-    // ── first render ──────────────────────────────────────────
     updateAll();
     applyRadiusTier();
 
@@ -868,7 +990,6 @@
     }
   }
 
-  // ── load specimens.json ─────────────────────────────────────
   fetch('specimens.json')
     .then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + res.statusText);
@@ -876,8 +997,6 @@
     })
     .then(function (data) {
       if (!Array.isArray(data)) throw new Error('specimens.json must contain a JSON array');
-      // Defer the heavy init one frame so the browser can paint the
-      // spinner and then freeze on the synchronous work.
       setTimeout(function () { init(data); }, 60);
     })
     .catch(function (err) {
